@@ -1,6 +1,6 @@
 # Binance Scalping Bot
 
-A high-performance cryptocurrency scalping bot built in Rust for Binance. This bot implements multiple technical analysis indicators and risk management strategies to execute profitable short-term trades.
+A not-so-high-performance cryptocurrency scalping bot built in Rust for Binance. This bot implements multiple technical analysis indicators and risk management strategies to execute profitable short-term trades.
 
 ## Features
 
