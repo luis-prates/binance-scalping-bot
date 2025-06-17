@@ -1,0 +1,98 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug unit tests in library 'binance_scalping_bot'",
+			"cargo": {
+				"args": [
+					"test",
+					"--no-run",
+					"--lib",
+					"--package=binance-scalping-bot"
+				],
+				"filter": {
+					"name": "binance_scalping_bot",
+					"kind": "lib"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug executable 'backtest'",
+			"cargo": {
+				"args": [
+					"build",
+					"--bin=backtest",
+					"--package=binance-scalping-bot"
+				],
+				"filter": {
+					"name": "backtest",
+					"kind": "bin"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug unit tests in executable 'backtest'",
+			"cargo": {
+				"args": [
+					"test",
+					"--no-run",
+					"--bin=backtest",
+					"--package=binance-scalping-bot"
+				],
+				"filter": {
+					"name": "backtest",
+					"kind": "bin"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug executable 'binance-scalping-bot'",
+			"cargo": {
+				"args": [
+					"build",
+					"--bin=binance-scalping-bot",
+					"--package=binance-scalping-bot"
+				],
+				"filter": {
+					"name": "binance-scalping-bot",
+					"kind": "bin"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug unit tests in executable 'binance-scalping-bot'",
+			"cargo": {
+				"args": [
+					"test",
+					"--no-run",
+					"--bin=binance-scalping-bot",
+					"--package=binance-scalping-bot"
+				],
+				"filter": {
+					"name": "binance-scalping-bot",
+					"kind": "bin"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		}
+	]
+}

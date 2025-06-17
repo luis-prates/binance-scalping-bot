@@ -1,0 +1,23 @@
+[binance]
+api_key = "your_binance_api_key_here"
+secret_key = "your_binance_secret_key_here"
+testnet = true
+base_url = "https://testnet.binance.vision"
+ws_url = "wss://testnet.binance.vision/ws"
+
+[trading]
+symbol = "BTCUSDT"
+timeframe = "1m"
+position_size = "10"
+max_positions = 3
+scalp_target_pct = "0.002"
+stop_loss_pct = "0.001"
+min_volume = "1000000"
+spread_threshold = "0.0005"
+
+[risk_management]
+max_daily_loss = "100"
+max_drawdown = "0.05"
+position_size_pct = "0.01"
+max_consecutive_losses = 5
+
