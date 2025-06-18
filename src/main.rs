@@ -2,17 +2,18 @@ mod backtester;
 mod binance;
 mod config;
 mod indicators;
+mod ml_model;
 mod strategy;
 
 use anyhow::Result;
 use binance::BinanceClient;
 use config::Config;
+use indicators::Signal;
 use log::{error, info, warn};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use strategy::{Position, ScalpingStrategy};
-use indicators::Signal;
 use tokio::time;
 use url::form_urlencoded::parse;
 
@@ -136,7 +137,9 @@ impl TradingBot {
     async fn trading_cycle(&mut self) -> Result<()> {
         // Update market data
         self.strategy.update_market_data(&self.client).await?;
-        self.strategy.update_higher_tf_market_data(&self.client).await?;
+        self.strategy
+            .update_higher_tf_market_data(&self.client)
+            .await?;
 
         // Check for exit conditions on existing positions
         if let Some(current_price) = self.get_current_price().await? {
@@ -155,9 +158,7 @@ impl TradingBot {
             let mut signal = Signal::Hold;
 
             // Check if we are in cooldown period
-            let current_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
             // Check cooldown
             if let Some(last_time) = self.strategy.last_signal_time {
@@ -234,8 +235,7 @@ impl TradingBot {
 
         info!(
             "BUY order placed successfully. Order ID: {}, Price: {}",
-            order_response.order_id,
-            order_price
+            order_response.order_id, order_price
         );
 
         // Calculate targets
@@ -288,8 +288,7 @@ impl TradingBot {
 
         info!(
             "SELL order placed successfully. Order ID: {}, Price: {}",
-            order_response.order_id,
-            order_price,
+            order_response.order_id, order_price,
         );
 
         // Calculate targets

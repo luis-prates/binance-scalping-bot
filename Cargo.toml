@@ -25,3 +25,9 @@ toml = "0.8"
 ctrlc = "3.4"
 base64 = "0.22"
 url = "2"
+
+linfa = "0.7.0"
+linfa-linear = "0.7.0"
+ndarray = "0.15.6"
+smartcore = { version = "0.2.1", features = ["serde"] }
+

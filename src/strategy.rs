@@ -1,12 +1,14 @@
 use crate::binance::{BinanceClient, OrderBookTicker, Ticker24hr};
 use crate::config::TradingConfig;
 use crate::indicators::*;
+use crate::ml_model::MLPredictor;
 use anyhow::Result;
+use log::{info, warn};
 use rust_decimal::Decimal;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::str::FromStr;
-use log::info;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct Position {
@@ -106,24 +108,29 @@ pub struct ScalpingStrategy {
 
     // Cooldown period for trades
     pub last_signal_time: Option<u64>, // Timestamp of the last signal
-    pub cooldown_duration: Duration,  // Cooldown period
+    pub cooldown_duration: Duration,   // Cooldown period
+
+    ml_predictor: MLPredictor,
+    last_training_time: Option<u64>,
 }
 
 impl ScalpingStrategy {
     pub fn new(config: TradingConfig) -> Self {
+        let ml_predictor = MLPredictor::new();
+
         Self {
             config: config.clone(),
             market_data: MarketData::new(200),
 
             // Initialize indicators with common scalping periods
             ema_crossover: EMACrossover::new(5, 13),
-            rsi: RSI::new(14),                          // 14-period RSI
+            rsi: RSI::new(14),          // 14-period RSI
             macd: MACD::new(12, 26, 9), // Standard MACD
             bollinger_bands: BollingerBands::new(20, Decimal::from(2)), // 20-period BB
             volume_profile: VolumeProfile::new(2),
 
             higher_tf_ema_crossover: EMACrossover::new(50, 200), // 50-period EMA for higher timeframe
-            higher_tf_market_data: MarketData::new(200), // Higher timeframe market data
+            higher_tf_market_data: MarketData::new(200),         // Higher timeframe market data
 
             positions: Vec::new(),
             total_trades: 0,
@@ -133,7 +140,24 @@ impl ScalpingStrategy {
 
             last_signal_time: None,
             cooldown_duration: Duration::from_secs(config.cooldown_period as u64),
+
+            ml_predictor,
+            last_training_time: None,
         }
+    }
+
+    pub async fn initialize(&mut self) -> Result<()> {
+        // Load the ML model if enabled
+        if self.config.ml_enabled {
+            let model_path = Path::new(&self.config.ml_model_path);
+            if model_path.exists() {
+                self.ml_predictor.load_model(model_path)?;
+                info!("Loaded ML model from {}", self.config.ml_model_path);
+            } else {
+                info!("No existing ML model found, will train new model");
+            }
+        }
+        Ok(())
     }
 
     pub async fn update_market_data(&mut self, client: &BinanceClient) -> Result<()> {
@@ -186,8 +210,12 @@ impl ScalpingStrategy {
             for kline in klines {
                 let close_price = Decimal::from_str(&kline.close)?;
                 let volume = Decimal::from_str(&kline.volume)?;
-                self.higher_tf_market_data
-                    .add_price_data(close_price, volume, kline.close_time, 200);
+                self.higher_tf_market_data.add_price_data(
+                    close_price,
+                    volume,
+                    kline.close_time,
+                    200,
+                );
             }
             info!("Initial higher timeframe market data loaded.");
         }
@@ -203,7 +231,11 @@ impl ScalpingStrategy {
         }
 
         // Update higher timeframe indicators
-        self.higher_tf_ema_crossover.update(self.higher_tf_market_data.get_latest_price().unwrap_or(Decimal::ZERO));
+        self.higher_tf_ema_crossover.update(
+            self.higher_tf_market_data
+                .get_latest_price()
+                .unwrap_or(Decimal::ZERO),
+        );
 
         Ok(())
     }
@@ -221,14 +253,36 @@ impl ScalpingStrategy {
         self.bollinger_bands.update(current_price);
 
         // Perform pre-trade checks or if we already have max positions
-        if !self.should_trade()?
-            || self.positions.len() >= self.config.max_positions as usize {
+        if !self.should_trade()? || self.positions.len() >= self.config.max_positions as usize {
             return Ok(Signal::Hold);
         }
+
+        // Prepare features for ML model
+        let features = self.ml_predictor.prepare_features(&self.market_data);
+
+        // Get ML prediction
+        let ml_prediction = self.ml_predictor.predict(features)?;
 
         // Generate signals based on multiple indicators
         let mut buy_signals = 0;
         let mut sell_signals = 0;
+
+        // Add ML predictions if enabled
+        if self.config.ml_enabled {
+            let features = self.ml_predictor.prepare_features(&self.market_data);
+            match self.ml_predictor.predict(features) {
+                Ok(prediction) => {
+                    if prediction > self.config.ml_prediction_threshold {
+                        buy_signals += 2; // Give ML prediction more weight
+                        info!("ML predicts strong buy signal: {:.2}", prediction);
+                    } else if prediction < (1.0 - self.config.ml_prediction_threshold) {
+                        sell_signals += 2;
+                        info!("ML predicts strong sell signal: {:.2}", prediction);
+                    }
+                }
+                Err(e) => warn!("ML prediction failed: {}", e),
+            }
+        }
 
         // EMA Crossover Signal
         if let Some(signal) = ema_crossover_signal {
@@ -276,7 +330,88 @@ impl ScalpingStrategy {
             sell_signals += 1;
         }
 
+        // Check if it's time to retrain the model
+        self.check_model_training()?;
+
         self.analyze_signals(&buy_signals, &sell_signals)
+    }
+
+    fn check_model_training(&mut self) -> Result<()> {
+        if !self.config.ml_enabled {
+            return Ok(());
+        }
+
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        if let Some(last_training) = self.last_training_time {
+            if current_time - last_training >= self.config.ml_training_interval {
+                self.train_model()?;
+                self.last_training_time = Some(current_time);
+            }
+        } else {
+            // First time training
+            self.train_model()?;
+            self.last_training_time = Some(current_time);
+        }
+
+        Ok(())
+    }
+
+    fn train_model(&mut self) -> Result<()> {
+        info!("Training ML model...");
+
+        // Prepare historical data for training
+        let prices: Vec<Decimal> = self.market_data.prices.iter().cloned().collect();
+        let volumes: Vec<Decimal> = self.market_data.volumes.iter().cloned().collect();
+
+        // Create labels (example: 1 for price increase, 0 for decrease)
+        let mut labels = Vec::new();
+        for i in 0..prices.len() - 1 {
+            let label = if prices[i + 1] > prices[i] { 1.0 } else { 0.0 };
+            labels.push(label);
+        }
+
+        info!("ML model training started");
+
+        // Train the model
+        self.ml_predictor.train(&self.market_data, &labels)?;
+
+        // Save the model
+        if let Err(e) = self
+            .ml_predictor
+            .save_model(Path::new(&self.config.ml_model_path))
+        {
+            warn!("Failed to save ML model: {}", e);
+        }
+
+        info!("ML model training completed");
+        Ok(())
+    }
+
+    pub fn update_ml_training_data(
+        &mut self,
+        position: &Position,
+        exit_price: Decimal,
+    ) -> Result<()> {
+        if !self.config.ml_enabled {
+            return Ok(());
+        }
+
+        // Calculate whether the trade was profitable
+        let was_profitable = match position.side.as_str() {
+            "BUY" => exit_price > position.entry_price,
+            "SELL" => exit_price < position.entry_price,
+            _ => return Ok(()),
+        };
+
+        // Get the features from when we entered the position
+        let features = self.ml_predictor.prepare_features(&self.market_data);
+
+        // Add to training data with label (1.0 for profitable, 0.0 for unprofitable)
+        self.ml_predictor
+            .add_training_data(features, if was_profitable { 1.0 } else { 0.0 });
+
+        Ok(())
     }
 
     fn analyze_signals(&mut self, buy_signals: &i32, sell_signals: &i32) -> Result<Signal> {
@@ -359,8 +494,16 @@ impl ScalpingStrategy {
         let momentum = self.calculate_momentum(); // Example: Price momentum
         let dynamic_target_pct = self.config.scalp_target_pct + (momentum / Decimal::from(100));
 
-        let target_pct = if self.config.dynamic_targets {dynamic_target_pct} else { self.config.scalp_target_pct };
-        let stop_pct = if self.config.dynamic_targets {dynamic_stop_pct} else {self.config.stop_loss_pct};
+        let target_pct = if self.config.dynamic_targets {
+            dynamic_target_pct
+        } else {
+            self.config.scalp_target_pct
+        };
+        let stop_pct = if self.config.dynamic_targets {
+            dynamic_stop_pct
+        } else {
+            self.config.stop_loss_pct
+        };
 
         match side {
             "BUY" => {
@@ -384,9 +527,11 @@ impl ScalpingStrategy {
 
     pub fn check_exit_conditions(&mut self, current_price: Decimal) -> Vec<usize> {
         let mut positions_to_close = Vec::new();
+        let mut should_exit = false;
+        let mut closed_positions = Vec::new();
 
         for (i, position) in self.positions.iter().enumerate() {
-            let should_exit = match position.side.as_str() {
+            should_exit = match position.side.as_str() {
                 "BUY" => {
                     current_price >= position.target_price || current_price <= position.stop_loss
                 }
@@ -398,6 +543,7 @@ impl ScalpingStrategy {
 
             if should_exit {
                 positions_to_close.push(i);
+                closed_positions.push(position.clone());
 
                 // Update P&L tracking
                 let pnl = self.calculate_pnl(position, current_price);
@@ -408,6 +554,14 @@ impl ScalpingStrategy {
                     self.consecutive_losses = 0;
                 } else {
                     self.consecutive_losses += 1;
+                }
+            }
+        }
+        if should_exit {
+            // Update ML training data
+            for position in &closed_positions {
+                if let Err(e) = self.update_ml_training_data(position, current_price) {
+                    warn!("Failed to update ML training data: {}", e);
                 }
             }
         }
@@ -456,7 +610,6 @@ impl ScalpingStrategy {
 
     // Returns Some("up"), Some("down"), or None if no clear trend
     pub fn get_trend(&self) -> Option<&'static str> {
-
         match self.ema_crossover.signal() {
             Signal::Buy => Some("up"),
             Signal::Sell => Some("down"),
@@ -470,15 +623,15 @@ impl ScalpingStrategy {
             (Some("up"), Signal::Buy) => {
                 info!("Uptrend detected, allowing buy signal");
                 Signal::Buy
-            },
+            }
             (Some("down"), Signal::Sell) => {
                 info!("Downtrend detected, allowing sell signal");
                 Signal::Sell
-            },
+            }
             _ => {
                 info!("No clear trend, holding position");
                 Signal::Hold
-            },
+            }
         }
     }
 }

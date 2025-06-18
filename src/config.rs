@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -24,12 +24,16 @@ pub struct TradingConfig {
     pub timeframe: String,
     pub position_size: Decimal,
     pub max_positions: u32,
-    pub scalp_target_pct: Decimal,  // Target profit percentage for scalp
-    pub stop_loss_pct: Decimal,     // Stop loss percentage
-    pub dynamic_targets: bool, // Use dynamic targets based on volatility
-    pub min_volume: Decimal,        // Minimum 24h volume to trade
-    pub spread_threshold: Decimal,  // Max spread to enter trade
-    pub cooldown_period: u64,       // Cooldown period in seconds between trades
+    pub scalp_target_pct: Decimal, // Target profit percentage for scalp
+    pub stop_loss_pct: Decimal,    // Stop loss percentage
+    pub dynamic_targets: bool,     // Use dynamic targets based on volatility
+    pub min_volume: Decimal,       // Minimum 24h volume to trade
+    pub spread_threshold: Decimal, // Max spread to enter trade
+    pub cooldown_period: u64,      // Cooldown period in seconds between trades
+    pub ml_enabled: bool,
+    pub ml_model_path: String,
+    pub ml_prediction_threshold: f64,
+    pub ml_training_interval: u64, // in seconds
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -60,7 +64,11 @@ impl Default for Config {
                 dynamic_targets: false, // Use dynamic targets based on volatility
                 min_volume: Decimal::from(1000000), // $1M daily volume
                 spread_threshold: Decimal::from_str_exact("0.0005").unwrap(), // 0.05%
-                cooldown_period: 60, // 60 seconds cooldown between trades
+                cooldown_period: 60,    // 60 seconds cooldown between trades
+                ml_enabled: true,
+                ml_model_path: "models/trading_model.json".to_string(),
+                ml_prediction_threshold: 0.6,
+                ml_training_interval: 3600, // Retrain every hour
             },
             risk_management: RiskManagementConfig {
                 max_daily_loss: Decimal::from(100),
@@ -74,12 +82,11 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let config_str = std::fs::read_to_string("config.toml")
-            .unwrap_or_else(|_| {
-                log::warn!("Config file not found, using default configuration");
-                String::new()
-            });
-        
+        let config_str = std::fs::read_to_string("config.toml").unwrap_or_else(|_| {
+            log::warn!("Config file not found, using default configuration");
+            String::new()
+        });
+
         if config_str.is_empty() {
             let default_config = Self::default();
             let toml_str = toml::to_string_pretty(&default_config)?;
@@ -90,4 +97,3 @@ impl Config {
         }
     }
 }
-
