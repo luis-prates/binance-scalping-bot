@@ -4,6 +4,7 @@ use crate::indicators::*;
 use crate::ml_model::MLPredictor;
 use anyhow::Result;
 use log::{info, warn};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -18,6 +19,8 @@ pub struct Position {
     pub target_price: Decimal,
     pub stop_loss: Decimal,
     pub timestamp: u64,
+    pub ml_prediction: f64, // ML prediction
+    pub features: Vec<f64>, // Features used for ML prediction
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +149,7 @@ impl ScalpingStrategy {
         }
     }
 
-    pub async fn initialize(&mut self) -> Result<()> {
+    pub async fn initialize_ml(&mut self) -> Result<()> {
         // Load the ML model if enabled
         if self.config.ml_enabled {
             let model_path = Path::new(&self.config.ml_model_path);
@@ -155,6 +158,7 @@ impl ScalpingStrategy {
                 info!("Loaded ML model from {}", self.config.ml_model_path);
             } else {
                 info!("No existing ML model found, will train new model");
+                self.train_model()?;
             }
         }
         Ok(())
@@ -240,7 +244,7 @@ impl ScalpingStrategy {
         Ok(())
     }
 
-    pub fn analyze_market(&mut self) -> Result<Signal> {
+    pub fn analyze_market(&mut self) -> Result<(Signal, f64, Vec<f64>)> {
         let current_price = self
             .market_data
             .get_latest_price()
@@ -254,24 +258,26 @@ impl ScalpingStrategy {
 
         // Perform pre-trade checks or if we already have max positions
         if !self.should_trade()? || self.positions.len() >= self.config.max_positions as usize {
-            return Ok(Signal::Hold);
+            return Ok((Signal::Hold, 0.5, Vec::new()));
         }
-
-        // Prepare features for ML model
-        let features = self.ml_predictor.prepare_features(&self.market_data);
-
-        // Get ML prediction
-        let ml_prediction = self.ml_predictor.predict(features)?;
 
         // Generate signals based on multiple indicators
         let mut buy_signals = 0;
         let mut sell_signals = 0;
 
+        let mut ml_prediction = 0.5; // Default neutral prediction
+        let features = if self.config.ml_enabled {
+            self.ml_predictor.prepare_features(&self.market_data)
+        } else {
+            Vec::new()
+        };
+
         // Add ML predictions if enabled
         if self.config.ml_enabled {
-            let features = self.ml_predictor.prepare_features(&self.market_data);
-            match self.ml_predictor.predict(features) {
+            // let features = self.ml_predictor.prepare_features(&self.market_data);
+            match self.ml_predictor.predict(features.clone()) {
                 Ok(prediction) => {
+                    ml_prediction = prediction;
                     if prediction > self.config.ml_prediction_threshold {
                         buy_signals += 2; // Give ML prediction more weight
                         info!("ML predicts strong buy signal: {:.2}", prediction);
@@ -331,9 +337,10 @@ impl ScalpingStrategy {
         }
 
         // Check if it's time to retrain the model
-        self.check_model_training()?;
+        // self.check_model_training()?;
 
         self.analyze_signals(&buy_signals, &sell_signals)
+            .map(|signal| (signal, ml_prediction, features))
     }
 
     fn check_model_training(&mut self) -> Result<()> {
@@ -362,7 +369,7 @@ impl ScalpingStrategy {
 
         // Prepare historical data for training
         let prices: Vec<Decimal> = self.market_data.prices.iter().cloned().collect();
-        let volumes: Vec<Decimal> = self.market_data.volumes.iter().cloned().collect();
+        // let volumes: Vec<Decimal> = self.market_data.volumes.iter().cloned().collect();
 
         // Create labels (example: 1 for price increase, 0 for decrease)
         let mut labels = Vec::new();
@@ -391,25 +398,66 @@ impl ScalpingStrategy {
     pub fn update_ml_training_data(
         &mut self,
         position: &Position,
-        exit_price: Decimal,
+        pnl: Decimal,
+        profit_pct: Decimal,
     ) -> Result<()> {
         if !self.config.ml_enabled {
             return Ok(());
         }
 
         // Calculate whether the trade was profitable
-        let was_profitable = match position.side.as_str() {
-            "BUY" => exit_price > position.entry_price,
-            "SELL" => exit_price < position.entry_price,
-            _ => return Ok(()),
-        };
+        let was_profitable = pnl > Decimal::ZERO;
+
+        // // Calculate profit percentage
+        // let profit_pct = match position.side.as_str() {
+        //     "BUY" => ((exit_price - position.entry_price) / position.entry_price)
+        //         .to_f64()
+        //         .unwrap_or(0.0),
+        //     "SELL" => ((position.entry_price - exit_price) / position.entry_price)
+        //         .to_f64()
+        //         .unwrap_or(0.0),
+        //     _ => 0.0,
+        // };
+
+        let profit_pct = profit_pct.to_f64().unwrap_or(0.0);
 
         // Get the features from when we entered the position
-        let features = self.ml_predictor.prepare_features(&self.market_data);
+        // this is not okay. These features should be from the time of the trade, not now
+        // This is a bug that needs to be fixed
+        // let features = self.ml_predictor.prepare_features(&self.market_data««);
+        //
+        // Record the prediction result
+        let predicted_profitable = position.ml_prediction > self.config.ml_prediction_threshold
+            || position.ml_prediction < (1.0 - self.config.ml_prediction_threshold);
 
-        // Add to training data with label (1.0 for profitable, 0.0 for unprofitable)
+        info!(
+            "ML Prediction: {}, Predicted profitable: {}, Was profitable: {}, Profit pct: {:.2}%",
+            position.ml_prediction,
+            predicted_profitable,
+            was_profitable,
+            profit_pct * 100.0
+        );
+        // Record the prediction result
+        // was_profitable used twice until logic is fixed
         self.ml_predictor
-            .add_training_data(features, if was_profitable { 1.0 } else { 0.0 });
+            .record_prediction_result(predicted_profitable, was_profitable);
+
+        // Add to training data with normalized profit percentage as label
+        // This provides more granular feedback than just binary profitable/unprofitable
+        let label = (profit_pct + 1.0) / 2.0; // Normalize to [0, 1] range
+        self.ml_predictor
+            .add_training_data(position.features.clone(), label);
+
+        // Log the trade result and model performance
+        if let Some((accuracy, correct, total)) = self.ml_predictor.get_performance_metrics() {
+            info!(
+                "Trade completed - Profit: {:.2}%, Model accuracy: {:.2}% ({}/{} correct predictions)",
+                profit_pct * 100.0,
+                accuracy,
+                correct,
+                total
+            );
+        }
 
         Ok(())
     }
@@ -431,7 +479,7 @@ impl ScalpingStrategy {
         // Check a spread threshold
         if let Some(spread) = self.market_data.get_spread() {
             if spread > self.config.spread_threshold {
-                log::warn!("Spread too wide: {spread:.4}%");
+                // log::warn!("Spread too wide: {spread:.4}%");
                 return Ok(false);
             }
         }
@@ -446,7 +494,7 @@ impl ScalpingStrategy {
         }
 
         // Check consecutive losses
-        if self.consecutive_losses >= self.config.max_positions {
+        if self.consecutive_losses >= self.config.max_consecutive_losses {
             log::warn!("Too many consecutive losses: {}", self.consecutive_losses);
             return Ok(false);
         }
@@ -527,11 +575,9 @@ impl ScalpingStrategy {
 
     pub fn check_exit_conditions(&mut self, current_price: Decimal) -> Vec<usize> {
         let mut positions_to_close = Vec::new();
-        let mut should_exit = false;
-        let mut closed_positions = Vec::new();
 
         for (i, position) in self.positions.iter().enumerate() {
-            should_exit = match position.side.as_str() {
+            let should_exit = match position.side.as_str() {
                 "BUY" => {
                     current_price >= position.target_price || current_price <= position.stop_loss
                 }
@@ -543,7 +589,6 @@ impl ScalpingStrategy {
 
             if should_exit {
                 positions_to_close.push(i);
-                closed_positions.push(position.clone());
 
                 // Update P&L tracking
                 let pnl = self.calculate_pnl(position, current_price);
@@ -554,14 +599,6 @@ impl ScalpingStrategy {
                     self.consecutive_losses = 0;
                 } else {
                     self.consecutive_losses += 1;
-                }
-            }
-        }
-        if should_exit {
-            // Update ML training data
-            for position in &closed_positions {
-                if let Err(e) = self.update_ml_training_data(position, current_price) {
-                    warn!("Failed to update ML training data: {}", e);
                 }
             }
         }

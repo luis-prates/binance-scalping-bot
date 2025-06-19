@@ -14,19 +14,28 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub struct MLPredictor {
-    model: Option<RandomForestRegressor<f64>>,
+    pub(crate) model: Option<RandomForestRegressor<f64>>,
     feature_window: usize,
     prediction_threshold: f64,
     training_data: Vec<(Vec<f64>, f64)>,
+    // Add new fields for tracking performance
+    trades_since_last_retrain: usize,
+    retrain_threshold: usize,
+    successful_predictions: usize,
+    total_predictions: usize,
 }
 
 impl MLPredictor {
     pub fn new() -> Self {
         Self {
             model: None,
-            feature_window: 20, // Look back window for features
+            feature_window: 150, // Look back window for features
             prediction_threshold: 0.6,
             training_data: Vec::new(),
+            trades_since_last_retrain: 0,
+            retrain_threshold: 10, // Retrain after every 10 trades
+            successful_predictions: 0,
+            total_predictions: 0,
         }
     }
 
@@ -195,5 +204,45 @@ impl MLPredictor {
 
         self.model = Some(model);
         Ok(())
+    }
+
+    // Add a method to track prediction accuracy
+    pub fn record_prediction_result(&mut self, predicted_profitable: bool, was_profitable: bool) {
+        self.total_predictions += 1;
+        if predicted_profitable == was_profitable {
+            info!("Correct prediction");
+            self.successful_predictions += 1;
+        }
+
+        self.trades_since_last_retrain += 1;
+
+        // Retrain model if we've collected enough new data
+        if self.trades_since_last_retrain >= self.retrain_threshold {
+            if let Err(e) = self.retrain() {
+                warn!("Failed to retrain model: {}", e);
+            } else {
+                info!(
+                    "Model retrained. Accuracy: {:.2}% ({}/{} correct predictions)",
+                    (self.successful_predictions as f64 / self.total_predictions as f64) * 100.0,
+                    self.successful_predictions,
+                    self.total_predictions
+                );
+            }
+            // Reset counters
+            self.trades_since_last_retrain = 0;
+        }
+    }
+
+    // Add a method to get model's performance metrics
+    pub fn get_performance_metrics(&self) -> Option<(f64, usize, usize)> {
+        if self.total_predictions == 0 {
+            return None;
+        }
+
+        Some((
+            (self.successful_predictions as f64 / self.total_predictions as f64) * 100.0,
+            self.successful_predictions,
+            self.total_predictions,
+        ))
     }
 }

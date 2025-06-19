@@ -1,24 +1,24 @@
 use crate::binance::{BinanceClient, Kline};
 use crate::config::TradingConfig;
-use crate::strategy::{Position, ScalpingStrategy};
 use crate::indicators::Signal;
+use crate::strategy::{Position, ScalpingStrategy};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use log::info;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
-use log::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestConfig {
     pub start_date: String, // "2024-01-01"
     pub end_date: String,   // "2024-12-31"
     pub initial_balance: Decimal,
-    pub commission_rate: Decimal,    // 0.001 = 0.1%
-    pub slippage: Decimal,           // 0.0001 = 0.01%
-    pub data_interval: String,       // "1m", "5m", etc.
-    pub max_klines_per_request: u16, // 1000
+    pub commission_rate: Decimal,     // 0.001 = 0.1%
+    pub slippage: Decimal,            // 0.0001 = 0.01%
+    pub data_interval: String,        // "1m", "5m", etc.
+    pub max_klines_per_request: u16,  // 1000
     pub filter_data_interval: String, // "1m", "5m", etc.
 }
 
@@ -143,11 +143,15 @@ impl Backtester {
             _ => return Err(anyhow::anyhow!("Unsupported filter data interval")),
         };
 
-        info!("Using higher timeframe filter interval of {}ms", htf_interval_ms);
+        info!(
+            "Using higher timeframe filter interval of {}ms",
+            htf_interval_ms
+        );
 
         // Process each kline
         for (i, kline) in klines.iter().enumerate() {
-            self.process_kline(&mut strategy, kline, i, &mut htf_buffer, htf_interval_ms).await?;
+            self.process_kline(&mut strategy, kline, i, &mut htf_buffer, htf_interval_ms)
+                .await?;
 
             // Log progress every 1000 klines
             if i % 1000 == 0 {
@@ -250,9 +254,20 @@ impl Backtester {
             // Aggregate OHLCV for the 5m candle
             let open = &htf_buffer.first().unwrap().open;
             let close = &htf_buffer.last().unwrap().close;
-            let high = htf_buffer.iter().map(|k| k.high.parse::<Decimal>().unwrap()).max().unwrap();
-            let low = htf_buffer.iter().map(|k| k.low.parse::<Decimal>().unwrap()).min().unwrap();
-            let volume: Decimal = htf_buffer.iter().map(|k| k.volume.parse::<Decimal>().unwrap()).sum();
+            let high = htf_buffer
+                .iter()
+                .map(|k| k.high.parse::<Decimal>().unwrap())
+                .max()
+                .unwrap();
+            let low = htf_buffer
+                .iter()
+                .map(|k| k.low.parse::<Decimal>().unwrap())
+                .min()
+                .unwrap();
+            let volume: Decimal = htf_buffer
+                .iter()
+                .map(|k| k.volume.parse::<Decimal>().unwrap())
+                .sum();
 
             // Create a synthetic 5m kline and update higher timeframe indicators
             let htf_kline = Kline {
@@ -272,7 +287,9 @@ impl Backtester {
                 htf_kline.close_time,
                 200,
             );
-            strategy.higher_tf_ema_crossover.update(Decimal::from_str(&htf_kline.close)?);
+            strategy
+                .higher_tf_ema_crossover
+                .update(Decimal::from_str(&htf_kline.close)?);
 
             htf_buffer.clear();
         }
@@ -282,7 +299,7 @@ impl Backtester {
             .await?;
 
         // Generate new signals
-        let signal = strategy.analyze_market()?;
+        let (signal, _, _) = strategy.analyze_market()?;
 
         match signal {
             Signal::Buy => {
@@ -357,6 +374,8 @@ impl Backtester {
             target_price,
             stop_loss,
             timestamp: time.timestamp() as u64,
+            features: vec![],
+            ml_prediction: 0.0,
         };
 
         // Create trade record

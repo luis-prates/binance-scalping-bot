@@ -63,6 +63,21 @@ impl TradingBot {
         // Main trading loop
         let mut interval = time::interval(Duration::from_secs(5)); // Check every 5 seconds
 
+        // Initialize strategy with market data7
+
+        self.strategy.update_market_data(&self.client).await?;
+        self.strategy
+            .update_higher_tf_market_data(&self.client)
+            .await?;
+
+        // Initialize ML model if enabled
+        if self.config.trading.ml_enabled {
+            if let Err(e) = self.strategy.initialize_ml().await {
+                error!("Failed to initialize ML model: {e}");
+                return Err(e);
+            }
+        }
+
         while self.is_running {
             if !running.load(std::sync::atomic::Ordering::SeqCst) {
                 info!("Shutting down trading bot...");
@@ -76,13 +91,21 @@ impl TradingBot {
                 // Continue running but log the error
             }
 
-            // Print performance stats every 100 cycles
-            let (total, winning, pnl, win_rate) = self.strategy.get_performance_stats();
-            if total > 0 && total % 10 == 0 {
+            // Print performance stats every 5 minutes
+            if SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() % 300 == 0 {
+                let (total, winning, pnl, win_rate) = self.strategy.get_performance_stats();
                 info!(
                     "Stats - Trades: {total}, Wins: {winning}, P&L: {pnl:.4}, Win Rate: {win_rate:.2}%",
                 );
             }
+
+            // Print performance stats every 100 cycles
+            // let (total, winning, pnl, win_rate) = self.strategy.get_performance_stats();
+            // if total > 0 && total % 10 == 0 {
+            //     info!(
+            //         "Stats - Trades: {total}, Wins: {winning}, P&L: {pnl:.4}, Win Rate: {win_rate:.2}%",
+            //     );
+            // }
         }
 
         Ok(())
@@ -147,8 +170,23 @@ impl TradingBot {
 
             // Close positions that hit targets or stop losses
             for &position_index in &positions_to_close {
+                let mut position_ml_train: Option<Position> = None;
+                let mut close_price = current_price;
+                let mut pnl = Decimal::ZERO;
+                let mut profit_pct = Decimal::ZERO;
+
                 if let Some(position) = self.strategy.get_positions().get(position_index) {
-                    self.close_position(position.clone(), current_price).await?;
+                    position_ml_train = Some(position.clone());
+                    (close_price, pnl, profit_pct) =
+                        self.close_position(position.clone(), current_price).await?;
+                }
+                if let Some(position_ml) = position_ml_train {
+                    if let Err(e) =
+                        self.strategy
+                            .update_ml_training_data(&position_ml, pnl, profit_pct)
+                    {
+                        warn!("Failed to update ML training data: {}", e);
+                    }
                 }
             }
 
@@ -156,6 +194,8 @@ impl TradingBot {
             self.strategy.remove_positions(positions_to_close);
 
             let mut signal = Signal::Hold;
+            let mut ml_prediction = 0.5;
+            let mut features = Vec::new();
 
             // Check if we are in cooldown period
             let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -164,11 +204,11 @@ impl TradingBot {
             if let Some(last_time) = self.strategy.last_signal_time {
                 if current_time > last_time + self.strategy.cooldown_duration.as_secs() {
                     // log::info!("In cooldown period, skipping signal generation.");
-                    signal = self.strategy.analyze_market()?;
+                    (signal, ml_prediction, features) = self.strategy.analyze_market()?;
                 }
             } else {
                 // No previous signal, analyze market
-                signal = self.strategy.analyze_market()?;
+                (signal, ml_prediction, features) = self.strategy.analyze_market()?;
             }
 
             // Analyze market for new opportunities
@@ -176,12 +216,14 @@ impl TradingBot {
                 Signal::Buy => {
                     info!("BUY signal detected at price: {current_price:.4}");
                     self.strategy.last_signal_time = Some(current_time);
-                    self.execute_buy_order(current_price).await?;
+                    self.execute_buy_order(current_price, ml_prediction, features)
+                        .await?;
                 }
                 Signal::Sell => {
                     info!("SELL signal detected at price: {current_price:.4}");
                     self.strategy.last_signal_time = Some(current_time);
-                    self.execute_sell_order(current_price).await?;
+                    self.execute_sell_order(current_price, ml_prediction, features)
+                        .await?;
                 }
                 Signal::Hold => {
                     // Do nothing
@@ -205,7 +247,12 @@ impl TradingBot {
         Ok(Some(mid_price))
     }
 
-    async fn execute_buy_order(&mut self, current_price: Decimal) -> Result<()> {
+    async fn execute_buy_order(
+        &mut self,
+        current_price: Decimal,
+        ml_prediction: f64,
+        features: Vec<f64>,
+    ) -> Result<()> {
         let quantity = self.strategy.calculate_position_size(current_price)?;
 
         // Format quantity to appropriate precision (this should be based on symbol info)
@@ -249,6 +296,8 @@ impl TradingBot {
             target_price,
             stop_loss,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            ml_prediction, // Store prediction from ML model
+            features,      // Store features for ML model
         };
 
         self.strategy.add_position(position);
@@ -258,7 +307,12 @@ impl TradingBot {
         Ok(())
     }
 
-    async fn execute_sell_order(&mut self, current_price: Decimal) -> Result<()> {
+    async fn execute_sell_order(
+        &mut self,
+        current_price: Decimal,
+        ml_prediction: f64,
+        features: Vec<f64>,
+    ) -> Result<()> {
         let quantity = self.strategy.calculate_position_size(current_price)?;
 
         // Format quantity to appropriate precision
@@ -302,6 +356,8 @@ impl TradingBot {
             target_price,
             stop_loss,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            ml_prediction, // Store prediction from ML model
+            features,      // Store features for ML model
         };
 
         self.strategy.add_position(position);
@@ -311,7 +367,11 @@ impl TradingBot {
         Ok(())
     }
 
-    async fn close_position(&self, position: Position, current_price: Decimal) -> Result<()> {
+    async fn close_position(
+        &self,
+        position: Position,
+        current_price: Decimal,
+    ) -> Result<(Decimal, Decimal, Decimal)> {
         let quantity_str = format!("{:.6}", position.quantity);
         let _price_str = format!("{current_price:.4}");
 
@@ -333,20 +393,31 @@ impl TradingBot {
             .await?;
 
         info!(
-            "Position closed successfully. Order ID: {}",
-            order_response.order_id
+            "Order status: {}; Price: {}",
+            order_response.status, order_response.price
+        );
+
+        // let current_price = Decimal::from_str(&order_response.price)?;
+        let executed_qty = Decimal::from_str(&order_response.executed_qty)?;
+
+        info!(
+            "Position closed successfully. Order ID: {}, Close price: {:.4}, Close quantity: {}",
+            order_response.order_id, order_response.price, executed_qty,
         );
 
         // Calculate P&L
         let pnl = match position.side.as_str() {
-            "BUY" => (current_price - position.entry_price) * position.quantity,
-            "SELL" => (position.entry_price - current_price) * position.quantity,
+            "BUY" => (current_price - position.entry_price) * executed_qty,
+            "SELL" => (position.entry_price - current_price) * executed_qty,
             _ => Decimal::ZERO,
         };
 
+        // calculate profit percentage
+        let profit_pct = pnl / (position.entry_price * executed_qty);
+
         info!("P&L for this trade: {pnl:.4} USDT",);
 
-        Ok(())
+        Ok((current_price, pnl, profit_pct))
     }
 
     pub fn stop(&mut self) {

@@ -34,6 +34,7 @@ pub struct TradingConfig {
     pub ml_model_path: String,
     pub ml_prediction_threshold: f64,
     pub ml_training_interval: u64, // in seconds
+    pub max_consecutive_losses: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -41,7 +42,6 @@ pub struct RiskManagementConfig {
     pub max_daily_loss: Decimal,
     pub max_drawdown: Decimal,
     pub position_size_pct: Decimal, // Percentage of portfolio per trade
-    pub max_consecutive_losses: u32,
 }
 
 impl Default for Config {
@@ -69,12 +69,12 @@ impl Default for Config {
                 ml_model_path: "models/trading_model.json".to_string(),
                 ml_prediction_threshold: 0.6,
                 ml_training_interval: 3600, // Retrain every hour
+                max_consecutive_losses: 5,
             },
             risk_management: RiskManagementConfig {
                 max_daily_loss: Decimal::from(100),
                 max_drawdown: Decimal::from_str_exact("0.05").unwrap(), // 5%
                 position_size_pct: Decimal::from_str_exact("0.01").unwrap(), // 1%
-                max_consecutive_losses: 5,
             },
         }
     }
